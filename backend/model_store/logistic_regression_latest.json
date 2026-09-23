@@ -1,0 +1,18 @@
+{
+  "model_name": "logistic_regression",
+  "version": "20260922T074942Z",
+  "artifact_path": "logistic_regression_20260922T074942Z.joblib",
+  "trained_at": "20260922T074942Z",
+  "feature_count": 19,
+  "metrics": {
+    "accuracy": 0.9367521367521368,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "roc_auc": 0.428733478003551,
+    "pr_auc": 0.052702240624060766,
+    "n_test": 1170,
+    "positive_rate_test": 0.06324786324786325
+  },
+  "evaluated": true
+}
