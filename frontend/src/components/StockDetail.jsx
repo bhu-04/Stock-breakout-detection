@@ -11,7 +11,7 @@ function IndicatorRow({ label, value, suffix = "" }) {
   );
 }
 
-export default function StockDetail({ symbol }) {
+export default function StockDetail({ symbol, currencySymbol = "$" }) {
   const [detail, setDetail] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -72,11 +72,11 @@ export default function StockDetail({ symbol }) {
           <div className="flex items-center gap-2">
             <h2 className="text-lg font-semibold text-ink-100">{detail.symbol}</h2>
             <span className="rounded bg-base-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-500">
-              {detail.is_live_data ? "LIVE" : "DEMO"}
+              {(detail.data_status || (detail.is_live_data ? "live" : "demo")).toUpperCase()}
             </span>
           </div>
           <div className="mt-0.5 font-mono text-2xl tabular text-ink-100">
-            ${detail.candles[detail.candles.length - 1]?.close.toFixed(2)}
+            {currencySymbol}{detail.candles[detail.candles.length - 1]?.close.toFixed(2)}
           </div>
         </div>
         {probPct !== null ? (

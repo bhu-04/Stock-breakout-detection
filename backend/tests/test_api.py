@@ -28,10 +28,12 @@ def test_stock_detail_unknown_symbol_returns_404():
 
 
 def test_stock_detail_known_symbol():
-    resp = client.get("/api/stock/AAPL?limit=60")
+    from backend.config.settings import settings
+    symbol = settings.watchlist_symbols[0]
+    resp = client.get(f"/api/stock/{symbol}?limit=60")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["symbol"] == "AAPL"
+    assert body["symbol"] == symbol
     assert len(body["candles"]) == 60
 
 

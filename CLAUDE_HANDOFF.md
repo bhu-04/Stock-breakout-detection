@@ -7,7 +7,7 @@ AI-Based Detection of Stock Breakout Opportunities Using Live Market Streams
 MVP complete and working end-to-end on demo data: backend pipeline
 (data -> features -> labels -> train -> calibrate -> infer -> rank ->
 API) and a React/Tailwind dashboard consuming it. All 4 model types
-trained and compared. 17/17 backend tests passing. Backtesting module
+trained and compared. 19/19 backend tests passing. Backtesting module
 implemented with an honest (non-compounded) return calculation.
 
 ## Working Features
@@ -149,52 +149,48 @@ npm run build    # production build (verified working)
   models" — simple and transparent, recorded in `model_store/champion.json`.
 
 ## Last Completed Task (this session)
-Added a genuine live provider, `AlpacaProvider` (backend/data/providers.py):
-- REST seed (`GET /v2/stocks/bars`, feed=iex) warms up `alpaca_seed_bar_limit`
-  (default 300) historical 1-min bars per watchlist symbol before anything
-  goes live, so RSI/MACD/ATR/etc. are never computed on a cold buffer.
-- A background daemon thread opens `wss://stream.data.alpaca.markets/v2/iex`,
-  authenticates, subscribes to the `bars` channel for the watchlist, and
-  appends/replaces bars into a lock-protected per-symbol DataFrame buffer.
-  Auto-reconnects with exponential backoff on drops; does NOT retry on an
-  auth rejection (treated as permanently unavailable until creds change).
-- `data_status` is a property: "unavailable" (bad/missing creds, or REST
-  seed totally failed), "delayed" (seeded but WS not yet authenticated),
-  "live" (WS authenticated + subscribed). `feed` is always "iex" and is
-  surfaced end-to-end so the UI shows "LIVE • IEX", never implying
-  full-market coverage.
-- `get_provider()`: Alpaca is treated as a deliberate LIVE choice — if
-  `ALPACA_API_KEY`/`ALPACA_API_SECRET` are missing, returns a new
-  `_UnavailableProvider` stub (`data_status="unavailable"`, every read
-  raises `ProviderUnavailableError`) instead of the old Alpha-Vantage-style
-  silent-fallback-to-demo behavior. Verified live against Alpaca's real API
-  (got a genuine 403 with bad test creds, correctly classified as
-  "unavailable" with a clear error message, no crash, no silent demo swap).
-- Existing per-symbol `ProviderUnavailableError` handling in
-  `inference/pipeline.py` (added last session) required NO changes — Alpaca
-  reuses it automatically.
-- API responses (`/api/health`, `/api/opportunities`, `/api/stock/{symbol}`)
-  now also return `data_feed`.
-- Frontend `Header`/`SystemStatusPanel` append `• IEX` to the LIVE label
-  when a feed is present.
-- Model, feature engineering, ranking, demo provider: untouched. No
-  retraining performed. 19/19 backend tests still passing, frontend build
-  still succeeds.
+Added `YFinanceProvider` (backend/data/providers.py) for Indian-market
+(NSE/BSE) support, since Alpaca and AlphaVantage don't cover Indian
+exchanges:
+- Backed by the `yfinance` package (unofficial Yahoo Finance wrapper) —
+  no API key, no broker account needed. Fetches on each call (no WS/push;
+  Yahoo doesn't offer one), which fits the existing polling dashboard fine.
+- Auto-qualifies bare symbols with `.NS` (configurable via
+  `YFINANCE_EXCHANGE_SUFFIX`) so a watchlist of `RELIANCE,TCS,INFY,...`
+  works without manually typing `.NS` everywhere; symbols that already
+  have a dot (e.g. `TCS.NS`, `AAPL` intentionally left as-is... actually
+  note: bare US tickers like `AAPL` WILL get `.NS` appended too under this
+  provider, since "has a dot" is the only signal — don't mix US and Indian
+  tickers in one yfinance watchlist).
+- `data_status` is hardcoded to `"delayed"`, never `"live"` — Yahoo data
+  has no real-time guarantee (commonly ~15min lag for NSE/BSE). Verified
+  the failure path is honest: with Yahoo unreachable (blocked in this
+  sandbox), it raises `ProviderUnavailableError` cleanly rather than
+  crashing or fabricating candles — reuses all the existing per-symbol
+  error handling from the Alpaca work, no pipeline changes needed.
+- Added `settings.currency_symbol` (default `"$"`), returned via
+  `/api/health`. Removed the two hardcoded `$` in the frontend
+  (`OpportunityTable.jsx`, `StockDetail.jsx`) — both now take a
+  `currencySymbol` prop sourced from `health.currency_symbol`. Also fixed
+  `StockDetail`'s LIVE/DEMO badge to use the real `data_status` field
+  instead of the old binary `is_live_data` check (was stale from an
+  earlier session).
+- `.env.example` documents a ready-to-uncomment Indian-market block
+  (`MARKET_DATA_PROVIDER=yfinance`, NSE watchlist, `CURRENCY_SYMBOL=₹`).
+- 19/19 backend tests pass, frontend build succeeds. Model, feature
+  engineering, ranking, demo provider: untouched, no retraining.
 
 ## NEXT TASK
-1. Get real Alpaca paper/live API keys, set `MARKET_DATA_PROVIDER=alpaca` +
-   `ALPACA_API_KEY`/`ALPACA_API_SECRET` in backend/.env, start uvicorn, and
-   confirm within a few seconds `/api/health` reports `data_status: "live"`,
-   `data_feed: "iex"` during market hours (during closed hours it will sit
-   at "delayed" — WS authenticates but no new bars arrive until the market
-   opens; this is expected, not a bug — consider adding an explicit
-   `market_open` flag if that ambiguity matters to the reviewer).
-2. Write README.md (still not created).
-3. Visually verify the dashboard in a real browser.
-4. Consider aggregating Alpaca's fixed 1-min live bars into 5-min candles
-   client-side in `_on_bar` if matching the demo data's 5-min granularity
-   turns out to matter for the champion model's real-world behavior (not
-   done here — out of scope for "don't retrain / minimal change").
+1. On a machine where Yahoo Finance is reachable, set
+   `MARKET_DATA_PROVIDER=yfinance`, `WATCHLIST=RELIANCE,TCS,INFY,HDFCBANK,...`,
+   `CURRENCY_SYMBOL=₹` in backend/.env and confirm `/api/opportunities`
+   returns real NSE candles with `data_status: "delayed"`.
+2. NOT implemented: NSE market-hours awareness (9:15–15:30 IST) — the
+   system will just show whatever yfinance returns (which itself goes
+   stale/flat outside NSE hours); no explicit "market closed" label exists
+   yet for this provider, unlike the Alpaca IEX path.
+3. Write README.md (still not created).
+4. Visually verify the dashboard in a real browser.
 
 ## DO NOT CHANGE (additions)
 - `AlpacaProvider._ws_run_forever`'s auth-failure branch (`return` instead

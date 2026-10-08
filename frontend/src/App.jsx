@@ -84,11 +84,12 @@ export default function App() {
                 opportunities={opportunitiesData.opportunities}
                 onSelect={setSelectedSymbol}
                 selectedSymbol={selectedSymbol}
+                currencySymbol={health?.currency_symbol}
               />
             )}
 
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_300px]">
-              <StockDetail symbol={selectedSymbol} />
+              <StockDetail symbol={selectedSymbol} currencySymbol={health?.currency_symbol} />
               <div className="flex flex-col gap-4">
                 <SystemStatusPanel
                   health={health}

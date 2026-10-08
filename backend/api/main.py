@@ -64,6 +64,7 @@ def health():
         "model_status": model_status,
         "update_count": _update_count,
         "watchlist_size": len(settings.watchlist_symbols),
+        "currency_symbol": settings.currency_symbol,
     }
 
 

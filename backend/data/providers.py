@@ -377,7 +377,6 @@ class AlpacaProvider(MarketDataProvider):
         import json
         import time
 
-        # pyrefly: ignore [missing-import]
         import websocket
 
         url = f"wss://stream.data.alpaca.markets/v2/{self.feed}"
@@ -468,6 +467,93 @@ class AlpacaProvider(MarketDataProvider):
         return self.get_ohlcv(symbol, limit=1).iloc[-1]
 
 
+class YFinanceProvider(MarketDataProvider):
+    """Live-ish provider backed by Yahoo Finance via the `yfinance` package.
+
+    Chosen for Indian-market (NSE/BSE) symbols because it needs no broker
+    account, no API key, and no KYC — just `pip install yfinance`. In
+    exchange it is genuinely delayed (commonly ~15 min for NSE/BSE) and is
+    an unofficial wrapper around Yahoo's endpoints (no SLA, can break).
+
+    Honesty notes:
+    - `data_status` is always "delayed" — never "live". Do not "upgrade"
+      this even if a response looks fresh; Yahoo does not publish a
+      latency guarantee.
+    - No push/WebSocket exists for this source — each `get_ohlcv` call does
+      a fresh pull. That's fine for the existing polling dashboard, which
+      already re-fetches `/api/opportunities` on an interval.
+    """
+
+    name = "yfinance"
+    feed = "yahoo"
+    data_status = "delayed"
+    is_live = False
+
+    def __init__(self, symbols: list[str], exchange_suffix: str = ".NS") -> None:
+        try:
+            import yfinance  # noqa: F401
+        except ImportError as exc:
+            raise ValueError("yfinance is not installed (pip install yfinance)") from exc
+        self.exchange_suffix = exchange_suffix
+        self.symbols = [self._qualify(s) for s in symbols]
+
+    def _qualify(self, symbol: str) -> str:
+        symbol = symbol.upper().strip()
+        # 1. Preserve explicitly qualified symbols (e.g. RELIANCE.NS, TCS.BO, BRK.B)
+        if "." in symbol:
+            return symbol
+        # 2. Do not blindly append .NS to known US-style bare tickers
+        us_bare_tickers = {"AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "AMD", "NFLX", "JPM"}
+        if symbol in us_bare_tickers:
+            return symbol
+        # 3. Keep current NSE behavior for the configured NSE watchlist symbols
+        indian_bare_symbols = {
+            "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "ITC", "LT", "HCLTECH"
+        }
+        if symbol in indian_bare_symbols:
+            return f"{symbol}{self.exchange_suffix}"
+        # 4. Default fallback for other unrecognized bare tickers
+        return symbol
+
+    def _fetch(self, symbol: str) -> pd.DataFrame:
+        import yfinance as yf
+
+        qualified = self._qualify(symbol)
+        try:
+            hist = yf.Ticker(qualified).history(
+                period=settings.yfinance_period,
+                interval=settings.yfinance_interval,
+                auto_adjust=False,
+            )
+        except Exception as exc:  # yfinance raises assorted exceptions on network/format errors
+            raise ProviderUnavailableError(f"yfinance error for {qualified}: {exc}") from exc
+
+        if hist is None or hist.empty:
+            raise ProviderUnavailableError(f"yfinance returned no data for {qualified} (bad symbol or no data)")
+
+        hist = hist.reset_index()
+        time_col = "Datetime" if "Datetime" in hist.columns else "Date"
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(hist[time_col], utc=True),
+                "open": hist["Open"].astype(float),
+                "high": hist["High"].astype(float),
+                "low": hist["Low"].astype(float),
+                "close": hist["Close"].astype(float),
+                "volume": hist["Volume"].astype(float),
+            }
+        ).sort_values("timestamp").reset_index(drop=True)
+        return df
+
+    def get_ohlcv(self, symbol: str, limit: int = 500) -> pd.DataFrame:
+        df = self._fetch(symbol)
+        return df.tail(limit).reset_index(drop=True)
+
+    def get_latest_candle(self, symbol: str) -> pd.Series:
+        df = self._fetch(symbol)
+        return df.iloc[-1]
+
+
 def get_provider() -> MarketDataProvider:
     """Factory selecting the configured provider.
 
@@ -478,6 +564,13 @@ def get_provider() -> MarketDataProvider:
     rather than silently swapping in demo data, per spec.
     """
     provider_name = settings.market_data_provider
+
+    if provider_name == "yfinance":
+        try:
+            return YFinanceProvider(settings.watchlist_symbols, settings.yfinance_exchange_suffix)
+        except ValueError as exc:
+            logger.error("yfinance provider misconfigured: %s", exc)
+            return _UnavailableProvider("yfinance", str(exc))
 
     if provider_name == "alpaca":
         try:

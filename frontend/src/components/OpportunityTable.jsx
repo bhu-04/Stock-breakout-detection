@@ -32,7 +32,7 @@ function ProbabilityBar({ value, isAlert }) {
   );
 }
 
-export default function OpportunityTable({ opportunities, onSelect, selectedSymbol }) {
+export default function OpportunityTable({ opportunities, onSelect, selectedSymbol, currencySymbol = "$" }) {
   const [search, setSearch] = useState("");
   const [minProb, setMinProb] = useState(0);
   const [sortKey, setSortKey] = useState("breakout_probability");
@@ -106,16 +106,15 @@ export default function OpportunityTable({ opportunities, onSelect, selectedSymb
               <tr
                 key={o.symbol}
                 onClick={() => onSelect(o.symbol)}
-                className={`cursor-pointer border-b border-base-850 transition-colors hover:bg-base-850 ${
-                  selectedSymbol === o.symbol ? "bg-base-850" : ""
-                }`}
+                className={`cursor-pointer border-b border-base-850 transition-colors hover:bg-base-850 ${selectedSymbol === o.symbol ? "bg-base-850" : ""
+                  }`}
               >
                 <td className="px-4 py-2.5 font-mono text-ink-500">{o.rank ?? "—"}</td>
                 <td className="px-4 py-2.5 font-semibold text-ink-100">{o.symbol}</td>
                 <td className="px-4 py-2.5">
                   <ProbabilityBar value={o.breakout_probability} isAlert={o.is_alert} />
                 </td>
-                <td className="px-4 py-2.5 font-mono tabular text-ink-300">${o.current_price?.toFixed(2)}</td>
+                <td className="px-4 py-2.5 font-mono tabular text-ink-300">{currencySymbol}{o.current_price?.toFixed(2)}</td>
                 <td className="px-4 py-2.5 font-mono tabular text-ink-300">{o.rsi ?? "—"}</td>
                 <td className="px-4 py-2.5 font-mono tabular text-ink-300">{o.relative_volume ? `${o.relative_volume}×` : "—"}</td>
                 <td className="px-4 py-2.5 text-ink-300">{o.trend_signal}</td>
