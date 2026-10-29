@@ -19,8 +19,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.backtesting.backtest import run_backtest
+from backend.config.market import InvalidSymbolError, qualify_symbol, session_status
 from backend.config.settings import settings
-from backend.data.providers import get_provider
+from backend.data.providers import ProviderUnavailableError, get_provider
 from backend.features.engineering import build_features
 from backend.inference.pipeline import data_status_summary, run_inference_cycle
 from backend.models.registry import ModelUnavailableError, list_available_models, load_model
@@ -44,6 +45,32 @@ _start_time = datetime.now(timezone.utc)
 _update_count = 0
 
 
+def _market_info() -> dict:
+    """Market the whole deployment is configured for. Every response carries it
+    so the frontend never has to guess (or default to) a market/currency."""
+    spec = settings.market_spec
+    return {
+        "market": spec.code,
+        "market_name": spec.name,
+        "exchange": settings.exchange_code,
+        "currency_code": spec.currency_code,
+        "currency_symbol": settings.display_currency_symbol,
+        "timezone": spec.timezone,
+        "locale": spec.locale,
+        "session": session_status(spec, holidays=settings.holiday_dates),
+    }
+
+
+def _require_configured_market(market: str | None) -> None:
+    """Optional explicit market on a request. This deployment serves ONE market;
+    asking for a different one is an error, never a silent substitution."""
+    if market is not None and market.strip().upper() != settings.market_spec.code:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Market {market.strip().upper()!r} is not served by this deployment (configured: {settings.market_spec.code})",
+        )
+
+
 @app.get("/api/health")
 def health():
     model_status = "unavailable"
@@ -64,13 +91,16 @@ def health():
         "model_status": model_status,
         "update_count": _update_count,
         "watchlist_size": len(settings.watchlist_symbols),
-        "currency_symbol": settings.currency_symbol,
+        "currency_symbol": settings.display_currency_symbol,
+        "market_info": _market_info(),
+        "config_warnings": settings.config_warnings,
     }
 
 
 @app.get("/api/opportunities")
-def opportunities():
+def opportunities(market: str | None = Query(None, description="Optional; must match the deployment's market")):
     global _update_count
+    _require_configured_market(market)
     results, model_meta = run_inference_cycle(settings.watchlist_symbols, _provider)
     ranked = rank_opportunities(results)
     status = data_status_summary(results, _provider)
@@ -85,6 +115,7 @@ def opportunities():
         "data_latency_ms": status["latency_ms"],
         "symbols_unavailable": status["symbols_unavailable"],
         "provider": _provider.name,
+        "market_info": _market_info(),
         "model": model_meta,
         "summary": {
             "stocks_monitored": len(ranked),
@@ -97,12 +128,18 @@ def opportunities():
 
 
 @app.get("/api/stock/{symbol}")
-def stock_detail(symbol: str, limit: int = Query(200, ge=30, le=1000)):
-    symbol = symbol.upper()
+def stock_detail(
+    symbol: str,
+    limit: int = Query(200, ge=30, le=1000),
+    market: str | None = Query(None, description="Optional; must match the deployment's market"),
+):
+    _require_configured_market(market)
+    try:
+        symbol = qualify_symbol(symbol, settings.market_spec, settings.exchange_code)
+    except InvalidSymbolError as exc:
+        raise HTTPException(status_code=404, detail=f"Invalid symbol for {settings.market_spec.name}: {exc}") from exc
     if symbol not in settings.watchlist_symbols:
         raise HTTPException(status_code=404, detail=f"{symbol} is not in the configured watchlist")
-
-    from backend.data.providers import ProviderUnavailableError
 
     try:
         raw = _provider.get_ohlcv(symbol, limit=limit)
@@ -142,6 +179,7 @@ def stock_detail(symbol: str, limit: int = Query(200, ge=30, le=1000)):
         "data_status": _provider.data_status,
         "data_feed": getattr(_provider, "feed", None),
         "provider": _provider.name,
+        "market_info": _market_info(),
         "candles": candles,
         "resistance": round(float(latest["resistance"]), 2) if latest["resistance"] == latest["resistance"] else None,
         "breakout_confirmation_price": (
@@ -214,5 +252,7 @@ def config():
         "probability_alert_threshold": settings.probability_alert_threshold,
         "watchlist": settings.watchlist_symbols,
         "market_data_provider": settings.market_data_provider,
+        "market_info": _market_info(),
+        "config_warnings": settings.config_warnings,
         "refresh_interval_seconds": settings.refresh_interval_seconds,
     }

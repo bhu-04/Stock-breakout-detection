@@ -25,8 +25,8 @@ def test_demo_provider_returns_expected_columns(raw_ohlcv):
 
 def test_demo_provider_deterministic_per_symbol():
     p = DemoDataProvider()
-    a = p.get_ohlcv("AAPL", limit=100)
-    b = p.get_ohlcv("AAPL", limit=100)
+    a = p.get_ohlcv("RELIANCE.NS", limit=100)
+    b = p.get_ohlcv("RELIANCE.NS", limit=100)
     pd.testing.assert_frame_equal(a, b)
 
 

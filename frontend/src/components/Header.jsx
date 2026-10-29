@@ -1,3 +1,5 @@
+import { formatTime, resolveMarketInfo, sessionLabel, timeZoneLabel } from "../lib/format";
+
 const STATUS_LABEL = {
   live: "LIVE",
   delayed: "DELAYED",
@@ -14,7 +16,9 @@ const STATUS_COLOR = {
   unavailable: "bg-red-600",
 };
 
-export default function Header({ health, lastUpdate, dataStatus, dataFeed }) {
+export default function Header({ health, lastUpdate, dataStatus, dataFeed, marketInfo }) {
+  const m = resolveMarketInfo(marketInfo);
+  const session = sessionLabel(m.session, m);
   const isStale = lastUpdate ? Date.now() - new Date(lastUpdate).getTime() > 60000 : false;
   const status = dataStatus || "demo";
   const label = (STATUS_LABEL[status] || status.toUpperCase()) + (dataFeed && status === "live" ? ` • ${dataFeed.toUpperCase()}` : "");
@@ -36,11 +40,19 @@ export default function Header({ health, lastUpdate, dataStatus, dataFeed }) {
           <span className={`h-1.5 w-1.5 rounded-full ${STATUS_COLOR[status] || "bg-accent-400"}`} />
           <span className="font-mono text-ink-300">{label}</span>
         </div>
+        <div className="hidden items-center gap-2 sm:flex">
+          <span className="rounded bg-base-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-300">
+            {m.exchange} · {m.market_name}
+          </span>
+          {session && (
+            <span className={m.session?.state === "open" ? "text-up" : "text-ink-500"}>{session}</span>
+          )}
+        </div>
         <div className="hidden text-ink-500 sm:block">
           {health?.watchlist_symbols_count ?? health?.watchlist_size ?? "—"} symbols
         </div>
         <div className="hidden text-ink-500 md:block">
-          Updated {lastUpdate ? new Date(lastUpdate).toLocaleTimeString() : "—"}
+          Updated {lastUpdate ? `${formatTime(lastUpdate, m)} ${timeZoneLabel(m.timezone)}` : "—"}
           {isStale && <span className="ml-1.5 text-accent-400">(stale)</span>}
         </div>
       </div>

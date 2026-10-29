@@ -15,6 +15,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from backend.config.market import InvalidSymbolError, MarketSpec, qualify_symbol
 from backend.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,9 @@ class MarketDataProvider(ABC):
     is_live: bool = False
     data_status: str = "demo"
     name: str = "abstract"
+    # Markets this provider can serve. A provider that does not list the
+    # selected market must not be used for it (see get_provider()).
+    supported_markets: tuple = ("IN", "US")
 
     @abstractmethod
     def get_ohlcv(self, symbol: str, limit: int = 500) -> pd.DataFrame:
@@ -60,6 +64,7 @@ class DemoDataProvider(MarketDataProvider):
     is_live = False
     data_status = "demo"
     name = "demo"
+    feed = "simulated"
 
     def __init__(self) -> None:
         self._cache: dict[str, pd.DataFrame] = {}
@@ -163,6 +168,7 @@ class AlphaVantageProvider(MarketDataProvider):
 
     is_live = True  # kept for backward-compat with existing UI checks
     name = "alphavantage"
+    supported_markets = ("US",)   # Indian coverage is not verified for this integration
 
     def __init__(self, api_key: str, entitlement: str = "delayed") -> None:
         if not api_key:
@@ -260,6 +266,7 @@ class AlpacaProvider(MarketDataProvider):
 
     name = "alpaca"
     feed = "iex"
+    supported_markets = ("US",)   # Alpaca market data covers US equities only
 
     def __init__(self, api_key: str, api_secret: str, symbols: list[str]) -> None:
         import threading
@@ -468,81 +475,124 @@ class AlpacaProvider(MarketDataProvider):
 
 
 class YFinanceProvider(MarketDataProvider):
-    """Live-ish provider backed by Yahoo Finance via the `yfinance` package.
+    """Delayed provider backed by Yahoo Finance via the `yfinance` package.
 
-    Chosen for Indian-market (NSE/BSE) symbols because it needs no broker
-    account, no API key, and no KYC — just `pip install yfinance`. In
-    exchange it is genuinely delayed (commonly ~15 min for NSE/BSE) and is
-    an unofficial wrapper around Yahoo's endpoints (no SLA, can break).
+    This is the default provider for the India (NSE/BSE) market: it needs no
+    broker account, API key or KYC. In exchange it is an UNOFFICIAL wrapper
+    around Yahoo's endpoints (no SLA, can break or rate-limit, licence for
+    redistribution is Yahoo's, not ours) and NSE/BSE data is commonly delayed.
 
     Honesty notes:
-    - `data_status` is always "delayed" — never "live". Do not "upgrade"
-      this even if a response looks fresh; Yahoo does not publish a
-      latency guarantee.
-    - No push/WebSocket exists for this source — each `get_ohlcv` call does
-      a fresh pull. That's fine for the existing polling dashboard, which
-      already re-fetches `/api/opportunities` on an interval.
+    - `data_status` is always "delayed", never "live", regardless of how fresh
+      a response looks. Yahoo publishes no latency guarantee.
+    - There is no push/WebSocket for this source. Each poll pulls candles; a
+      short TTL cache (settings.yfinance_cache_ttl_seconds) keeps the
+      dashboard's polling from hammering Yahoo.
+    - A symbol that cannot be qualified or that Yahoo has no data for raises
+      ProviderUnavailableError. It is NEVER replaced by another symbol or by
+      US/demo data.
     """
 
     name = "yfinance"
     feed = "yahoo"
     data_status = "delayed"
     is_live = False
+    supported_markets = ("IN", "US")
 
-    def __init__(self, symbols: list[str], exchange_suffix: str = ".NS") -> None:
+    def __init__(self, symbols: Optional[list[str]] = None, market: str = "IN", exchange: Optional[str] = None) -> None:
+        import threading
+
         try:
             import yfinance  # noqa: F401
         except ImportError as exc:
             raise ValueError("yfinance is not installed (pip install yfinance)") from exc
-        self.exchange_suffix = exchange_suffix
-        self.symbols = [self._qualify(s) for s in symbols]
+
+        from backend.config.market import get_market, resolve_exchange
+
+        self.market: MarketSpec = get_market(market)
+        self.exchange: str = resolve_exchange(self.market, exchange)
+        self.symbols = [self._qualify(s) for s in (symbols or [])]
+        self._cache: dict[tuple, tuple[float, pd.DataFrame]] = {}
+        self._cache_lock = threading.Lock()
+        self._last_latency_ms: Optional[float] = None
 
     def _qualify(self, symbol: str) -> str:
-        symbol = symbol.upper().strip()
-        # 1. Preserve explicitly qualified symbols (e.g. RELIANCE.NS, TCS.BO, BRK.B)
-        if "." in symbol:
-            return symbol
-        # 2. Do not blindly append .NS to known US-style bare tickers
-        us_bare_tickers = {"AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "AMD", "NFLX", "JPM"}
-        if symbol in us_bare_tickers:
-            return symbol
-        # 3. Keep current NSE behavior for the configured NSE watchlist symbols
-        indian_bare_symbols = {
-            "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "ITC", "LT", "HCLTECH"
-        }
-        if symbol in indian_bare_symbols:
-            return f"{symbol}{self.exchange_suffix}"
-        # 4. Default fallback for other unrecognized bare tickers
-        return symbol
+        return qualify_symbol(symbol, self.market, self.exchange)
+
+    def _cache_key(self, qualified: str) -> tuple:
+        # market + exchange + symbol + interval + period: a change to any of
+        # them must never be served another configuration's candles.
+        return (self.market.code, self.exchange, qualified, settings.yfinance_interval, settings.yfinance_period)
+
+    def _normalise(self, hist: pd.DataFrame, qualified: str) -> pd.DataFrame:
+        hist = hist.reset_index()
+        time_col = next((c for c in ("Datetime", "Date", "index") if c in hist.columns), None)
+        required = {"Open", "High", "Low", "Close", "Volume"}
+        if time_col is None or not required.issubset(hist.columns):
+            raise ProviderUnavailableError(f"yfinance returned an unexpected schema for {qualified}: {list(hist.columns)}")
+
+        ts = pd.to_datetime(hist[time_col])
+        if ts.dt.tz is None:
+            # Naive timestamps are exchange-local wall-clock time. Labelling them UTC
+            # would shift every candle by the UTC offset (5h30m for IST).
+            ts = ts.dt.tz_localize(self.market.tz, ambiguous="NaT", nonexistent="NaT")
+        ts = ts.dt.tz_convert("UTC")
+
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": pd.to_numeric(hist["Open"], errors="coerce"),
+                "high": pd.to_numeric(hist["High"], errors="coerce"),
+                "low": pd.to_numeric(hist["Low"], errors="coerce"),
+                "close": pd.to_numeric(hist["Close"], errors="coerce"),
+                "volume": pd.to_numeric(hist["Volume"], errors="coerce"),
+            }
+        )
+        # Yahoo emits NaN OHLC rows for missing intervals; drop them rather than
+        # forward-filling (which would fabricate candles).
+        df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+        df["volume"] = df["volume"].fillna(0.0)
+        df = df[(df[["open", "high", "low", "close"]] > 0).all(axis=1)]
+        df = df.drop_duplicates(subset="timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
+        if df.empty:
+            raise ProviderUnavailableError(f"yfinance returned only invalid candles for {qualified}")
+        return df
 
     def _fetch(self, symbol: str) -> pd.DataFrame:
+        import time
+
         import yfinance as yf
 
-        qualified = self._qualify(symbol)
+        try:
+            qualified = self._qualify(symbol)
+        except InvalidSymbolError as exc:
+            raise ProviderUnavailableError(f"invalid symbol for {self.market.name}/{self.exchange}: {exc}") from exc
+
+        key = self._cache_key(qualified)
+        ttl = settings.yfinance_cache_ttl_seconds
+        now = time.monotonic()
+        with self._cache_lock:
+            hit = self._cache.get(key)
+        if hit is not None and ttl > 0 and now - hit[0] < ttl:
+            return hit[1]
+
+        t0 = time.monotonic()
         try:
             hist = yf.Ticker(qualified).history(
                 period=settings.yfinance_period,
                 interval=settings.yfinance_interval,
                 auto_adjust=False,
             )
-        except Exception as exc:  # yfinance raises assorted exceptions on network/format errors
+        except Exception as exc:  # yfinance raises assorted exceptions on network/format/rate-limit errors
             raise ProviderUnavailableError(f"yfinance error for {qualified}: {exc}") from exc
+        self._last_latency_ms = (time.monotonic() - t0) * 1000
 
         if hist is None or hist.empty:
-            raise ProviderUnavailableError(f"yfinance returned no data for {qualified} (bad symbol or no data)")
+            raise ProviderUnavailableError(f"yfinance returned no data for {qualified} (bad symbol, delisted, or no data)")
 
-        hist = hist.reset_index()
-        time_col = "Datetime" if "Datetime" in hist.columns else "Date"
-        df = pd.DataFrame(
-            {
-                "timestamp": pd.to_datetime(hist[time_col], utc=True),
-                "open": hist["Open"].astype(float),
-                "high": hist["High"].astype(float),
-                "low": hist["Low"].astype(float),
-                "close": hist["Close"].astype(float),
-                "volume": hist["Volume"].astype(float),
-            }
-        ).sort_values("timestamp").reset_index(drop=True)
+        df = self._normalise(hist, qualified)
+        with self._cache_lock:
+            self._cache[key] = (time.monotonic(), df)
         return df
 
     def get_ohlcv(self, symbol: str, limit: int = 500) -> pd.DataFrame:
@@ -554,46 +604,11 @@ class YFinanceProvider(MarketDataProvider):
         return df.iloc[-1]
 
 
-def get_provider() -> MarketDataProvider:
-    """Factory selecting the configured provider.
-
-    Alpha Vantage falls back to demo if misconfigured (existing, unchanged
-    behavior — treated as an optional convenience feed). Alpaca is treated
-    as a deliberate LIVE choice: if requested but misconfigured, we return
-    an AlpacaProvider whose `data_status` honestly reports "unavailable"
-    rather than silently swapping in demo data, per spec.
-    """
-    provider_name = settings.market_data_provider
-
-    if provider_name == "yfinance":
-        try:
-            return YFinanceProvider(settings.watchlist_symbols, settings.yfinance_exchange_suffix)
-        except ValueError as exc:
-            logger.error("yfinance provider misconfigured: %s", exc)
-            return _UnavailableProvider("yfinance", str(exc))
-
-    if provider_name == "alpaca":
-        try:
-            return AlpacaProvider(settings.alpaca_api_key, settings.alpaca_api_secret, settings.watchlist_symbols)
-        except ValueError as exc:
-            # missing credentials entirely: still don't fall back to demo —
-            # return a minimal stub provider that always reports "unavailable"
-            logger.error("Alpaca provider misconfigured: %s", exc)
-            return _UnavailableProvider("alpaca", str(exc))
-
-    if provider_name == "alphavantage" and settings.alphavantage_api_key:
-        try:
-            return AlphaVantageProvider(settings.alphavantage_api_key, settings.alphavantage_entitlement)
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            logger.warning("Falling back to demo data provider: %s", exc)
-            return DemoDataProvider()
-    return DemoDataProvider()
-
-
 class _UnavailableProvider(MarketDataProvider):
-    """Stub used when a LIVE provider was explicitly requested but cannot be
-    constructed at all (e.g. no credentials configured). Never pretends to
-    be demo data — every call raises ProviderUnavailableError."""
+    """Stub used when a provider was explicitly requested but cannot serve the
+    selected market / cannot be constructed (no credentials, wrong market,
+    unknown provider name). Never pretends to be demo data - every call raises
+    ProviderUnavailableError so the UI shows DATA UNAVAILABLE."""
 
     data_status = "unavailable"
     is_live = False
@@ -607,3 +622,62 @@ class _UnavailableProvider(MarketDataProvider):
 
     def get_latest_candle(self, symbol: str) -> pd.Series:
         raise ProviderUnavailableError(f"{self.name} not configured: {self.reason}")
+
+
+def get_provider() -> MarketDataProvider:
+    """Factory selecting the configured provider for the configured market.
+
+    Rules (none of them ever substitutes US data for an Indian selection):
+    - A provider that does not support the selected market yields an
+      `_UnavailableProvider` with an explanatory reason.
+    - An unknown MARKET_DATA_PROVIDER value yields `_UnavailableProvider`;
+      it is NOT silently treated as demo.
+    - "demo" is only used when explicitly requested (or, as before, when
+      Alpha Vantage is selected for a supported market without a key) and is
+      always labelled as demo data.
+    - Alpaca never falls back to demo (existing behaviour, unchanged).
+    """
+    provider_name = settings.market_data_provider.strip().lower()
+    market = settings.market_spec
+
+    def _unsupported(name: str) -> "_UnavailableProvider":
+        reason = (
+            f"{name} does not serve the {market.name} market ({market.code}). "
+            f"Use MARKET_DATA_PROVIDER=yfinance for NSE/BSE data."
+        )
+        logger.error(reason)
+        return _UnavailableProvider(name, reason)
+
+    if provider_name == "yfinance":
+        try:
+            return YFinanceProvider(settings.watchlist_symbols, market.code, settings.exchange_code)
+        except ValueError as exc:
+            logger.error("yfinance provider misconfigured: %s", exc)
+            return _UnavailableProvider("yfinance", str(exc))
+
+    if provider_name == "alpaca":
+        if market.code not in AlpacaProvider.supported_markets:
+            return _unsupported("alpaca")
+        try:
+            return AlpacaProvider(settings.alpaca_api_key, settings.alpaca_api_secret, settings.watchlist_symbols)
+        except ValueError as exc:
+            # missing credentials entirely: still don't fall back to demo
+            logger.error("Alpaca provider misconfigured: %s", exc)
+            return _UnavailableProvider("alpaca", str(exc))
+
+    if provider_name == "alphavantage":
+        if market.code not in AlphaVantageProvider.supported_markets:
+            return _unsupported("alphavantage")
+        if settings.alphavantage_api_key:
+            try:
+                return AlphaVantageProvider(settings.alphavantage_api_key, settings.alphavantage_entitlement)
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.warning("Falling back to demo data provider: %s", exc)
+        return DemoDataProvider()
+
+    if provider_name == "demo":
+        return DemoDataProvider()
+
+    reason = f"unknown MARKET_DATA_PROVIDER {settings.market_data_provider!r}; expected yfinance | demo | alphavantage | alpaca"
+    logger.error(reason)
+    return _UnavailableProvider(provider_name or "unset", reason)

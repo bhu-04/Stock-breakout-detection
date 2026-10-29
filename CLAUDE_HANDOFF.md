@@ -216,3 +216,14 @@ exchanges:
 A new Claude instance should read this file + PROJECT_SPEC.md + README.md,
 then run `python -m pytest backend/tests -v` to confirm the repo is still
 in a working state before making changes.
+
+## Session: India-by-default fix
+Root cause of the US display: Indian support was opt-in via the gitignored `backend/.env`, while the
+code defaults were `MARKET_DATA_PROVIDER=demo`, a US WATCHLIST and `$`. A deployed backend has no `.env`,
+so it always ran those defaults. `YFinanceProvider._qualify` also passed US bare tickers through unsuffixed.
+Changes: new `backend/config/market.py` (market specs, symbol qualification, session logic); India/NSE/yfinance
+defaults in `settings.py`; `get_provider()` refuses US-only providers for India and no longer treats unknown
+names as demo; yfinance candles normalised (tz, NaN rows, duplicates) + TTL cache keyed by market/exchange/
+symbol/interval/period; `market_info` on API responses; frontend INR/IST formatting (`src/lib/format.js`).
+Not done / open: model retraining on real Indian data (see README limitations); official holiday calendar
+(supply via `MARKET_HOLIDAYS`); live Yahoo verification; no deployment config exists in the repo.

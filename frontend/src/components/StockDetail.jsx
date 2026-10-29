@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import CandlestickChart from "./CandlestickChart";
+import { formatPrice, resolveMarketInfo } from "../lib/format";
 
 function IndicatorRow({ label, value, suffix = "" }) {
   return (
@@ -11,7 +12,8 @@ function IndicatorRow({ label, value, suffix = "" }) {
   );
 }
 
-export default function StockDetail({ symbol, currencySymbol = "$" }) {
+export default function StockDetail({ symbol, marketInfo }) {
+  const m = resolveMarketInfo(marketInfo);
   const [detail, setDetail] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -76,7 +78,7 @@ export default function StockDetail({ symbol, currencySymbol = "$" }) {
             </span>
           </div>
           <div className="mt-0.5 font-mono text-2xl tabular text-ink-100">
-            {currencySymbol}{detail.candles[detail.candles.length - 1]?.close.toFixed(2)}
+            {formatPrice(detail.candles[detail.candles.length - 1]?.close, m)}
           </div>
         </div>
         {probPct !== null ? (
@@ -96,6 +98,7 @@ export default function StockDetail({ symbol, currencySymbol = "$" }) {
       <div className="grid grid-cols-1 gap-4 p-4 lg:grid-cols-[1fr_220px]">
         <CandlestickChart
           candles={detail.candles}
+          marketInfo={m}
           resistance={detail.resistance}
           confirmationPrice={detail.breakout_confirmation_price}
         />
@@ -113,8 +116,8 @@ export default function StockDetail({ symbol, currencySymbol = "$" }) {
 
           <div>
             <div className="mb-1.5 text-[11px] uppercase tracking-wide text-ink-500">Levels</div>
-            <IndicatorRow label="Resistance" value={detail.resistance} />
-            <IndicatorRow label="Confirmation Zone" value={detail.breakout_confirmation_price} />
+            <IndicatorRow label="Resistance" value={detail.resistance !== null ? formatPrice(detail.resistance, m) : null} />
+            <IndicatorRow label="Confirmation Zone" value={detail.breakout_confirmation_price !== null ? formatPrice(detail.breakout_confirmation_price, m) : null} />
           </div>
 
           {detail.model && (

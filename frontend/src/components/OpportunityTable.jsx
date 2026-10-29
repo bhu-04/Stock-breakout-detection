@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { formatPrice, formatTime, timeZoneLabel, resolveMarketInfo } from "../lib/format";
 
 const COLUMNS = [
   { key: "rank", label: "Rank" },
@@ -32,7 +33,8 @@ function ProbabilityBar({ value, isAlert }) {
   );
 }
 
-export default function OpportunityTable({ opportunities, onSelect, selectedSymbol, currencySymbol = "$" }) {
+export default function OpportunityTable({ opportunities, onSelect, selectedSymbol, marketInfo }) {
+  const m = resolveMarketInfo(marketInfo);
   const [search, setSearch] = useState("");
   const [minProb, setMinProb] = useState(0);
   const [sortKey, setSortKey] = useState("breakout_probability");
@@ -114,7 +116,7 @@ export default function OpportunityTable({ opportunities, onSelect, selectedSymb
                 <td className="px-4 py-2.5">
                   <ProbabilityBar value={o.breakout_probability} isAlert={o.is_alert} />
                 </td>
-                <td className="px-4 py-2.5 font-mono tabular text-ink-300">{currencySymbol}{o.current_price?.toFixed(2)}</td>
+                <td className="px-4 py-2.5 font-mono tabular text-ink-300">{formatPrice(o.current_price, m)}</td>
                 <td className="px-4 py-2.5 font-mono tabular text-ink-300">{o.rsi ?? "—"}</td>
                 <td className="px-4 py-2.5 font-mono tabular text-ink-300">{o.relative_volume ? `${o.relative_volume}×` : "—"}</td>
                 <td className="px-4 py-2.5 text-ink-300">{o.trend_signal}</td>
@@ -122,7 +124,7 @@ export default function OpportunityTable({ opportunities, onSelect, selectedSymb
                   {o.distance_from_resistance_pct !== null ? `${o.distance_from_resistance_pct}%` : "—"}
                 </td>
                 <td className="px-4 py-2.5 font-mono text-ink-500">
-                  {new Date(o.last_updated).toLocaleTimeString()}
+                  {formatTime(o.last_updated, m)} {timeZoneLabel(m.timezone)}
                 </td>
               </tr>
             ))}

@@ -1,3 +1,5 @@
+import { resolveMarketInfo, sessionLabel } from "../lib/format";
+
 function StatusRow({ label, ok, okLabel, badLabel }) {
   return (
     <div className="flex items-center justify-between py-1.5 text-xs">
@@ -12,13 +14,15 @@ function StatusRow({ label, ok, okLabel, badLabel }) {
 
 const DATA_STATUS_LABEL = {
   live: "Live",
-  delayed: "Delayed (Alpha Vantage free tier)",
+  delayed: "Delayed",
   demo: "Demo / Simulated",
   partial: "Partial (some symbols unavailable)",
   unavailable: "Unavailable",
 };
 
-export default function SystemStatusPanel({ health, error, lastUpdate, staleAfterMs = 60000, dataStatus, dataFeed, latencyMs, symbolsUnavailable }) {
+export default function SystemStatusPanel({ health, error, lastUpdate, staleAfterMs = 60000, dataStatus, dataFeed, latencyMs, symbolsUnavailable, marketInfo, provider }) {
+  const m = resolveMarketInfo(marketInfo);
+  const session = sessionLabel(m.session, m);
   const isStale = lastUpdate ? Date.now() - new Date(lastUpdate).getTime() > staleAfterMs : false;
   const status = dataStatus || health?.data_status || "demo";
 
@@ -26,6 +30,22 @@ export default function SystemStatusPanel({ health, error, lastUpdate, staleAfte
     <div className="rounded border border-base-800 bg-base-900 p-4">
       <div className="mb-2 text-[11px] uppercase tracking-wide text-ink-500">System Status</div>
       <StatusRow label="Market feed" ok={!error} okLabel="Active" badLabel="Unreachable" />
+      <div className="flex items-center justify-between py-1.5 text-xs">
+        <span className="text-ink-500">Market</span>
+        <span className="font-mono text-ink-300">{m.exchange} · {m.market_name} · {m.currency_code}</span>
+      </div>
+      {session && (
+        <div className="flex items-center justify-between py-1.5 text-xs">
+          <span className="text-ink-500">Session</span>
+          <span className={`font-medium ${m.session?.state === "open" ? "text-up" : "text-ink-300"}`}>{session}</span>
+        </div>
+      )}
+      {provider && (
+        <div className="flex items-center justify-between py-1.5 text-xs">
+          <span className="text-ink-500">Provider</span>
+          <span className="font-mono text-ink-300">{provider}</span>
+        </div>
+      )}
       <div className="flex items-center justify-between py-1.5 text-xs">
         <span className="text-ink-500">Data status</span>
         <span
@@ -38,6 +58,13 @@ export default function SystemStatusPanel({ health, error, lastUpdate, staleAfte
         <div className="flex items-center justify-between py-1.5 text-xs">
           <span className="text-ink-500">Data latency</span>
           <span className="font-mono text-ink-300">{latencyMs} ms</span>
+        </div>
+      )}
+      {health?.config_warnings?.length > 0 && (
+        <div className="mt-1 space-y-1 text-[11px] text-accent-400">
+          {health.config_warnings.map((w) => (
+            <div key={w}>⚠ {w}</div>
+          ))}
         </div>
       )}
       {symbolsUnavailable?.length > 0 && (
