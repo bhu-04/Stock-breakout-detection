@@ -1,9 +1,20 @@
-"""FastAPI application.
+"""FastAPI application - one backend serving the India (IN) and US markets.
+
+Every market-aware endpoint takes an explicit `market` (IN | US). When it is
+omitted on a READ it falls back to the default market (settings.market, India);
+WRITES always require it. A symbol is only ever interpreted against the market it
+was sent for, and a market's data is only ever fetched through that market's own
+provider instance.
 
 Endpoints:
-  GET  /api/health            -> system/status
-  GET  /api/opportunities     -> ranked opportunity list (live/demo inference cycle)
-  GET  /api/stock/{symbol}    -> candlestick history + detail view data
+  GET    /api/markets            -> supported markets: labels, currency, time zone, live session state
+  GET    /api/health?market=     -> system/status for a market
+  GET    /api/watchlist?market=  -> a market's watchlist (defaults + user edits)
+  POST   /api/watchlist          -> add a symbol {market, symbol} (validated against the data provider)
+  DELETE /api/watchlist/{symbol}?market=  -> remove a symbol
+  POST   /api/watchlist/reset    -> restore a market's default watchlist {market}
+  GET    /api/opportunities?market=  -> ranked breakout list for the market's whole watchlist
+  GET    /api/stock/{symbol}?market= -> candlestick history + detail view data
   GET  /api/model/info        -> current champion model metadata + metrics
   GET  /api/models            -> all trained model pointers (for comparison)
   POST /api/train             -> trigger training (blocking; intended for small demo datasets)
@@ -13,14 +24,24 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from backend.backtesting.backtest import run_backtest
+from backend.config.market import MARKETS, InvalidSymbolError, MarketSpec, get_market, qualify_symbol, session_status
 from backend.config.settings import settings
-from backend.data.providers import get_provider
+from backend.data.providers import (
+    PROVIDER_MARKETS,
+    MarketDataProvider,
+    ProviderUnavailableError,
+    SymbolNotFoundError,
+    get_provider,
+)
+from backend.data.watchlist_store import WatchlistError, get_store
 from backend.features.engineering import build_features
 from backend.inference.pipeline import data_status_summary, run_inference_cycle
 from backend.models.registry import ModelUnavailableError, list_available_models, load_model
@@ -30,7 +51,7 @@ from backend.training.train import build_training_dataset, time_aware_split, tra
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI Stock Breakout Detection", version="0.1.0")
+app = FastAPI(title="AI Stock Breakout Detection", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,13 +60,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_provider = get_provider()
 _start_time = datetime.now(timezone.utc)
-_update_count = 0
+_update_counts: dict[str, int] = {code: 0 for code in MARKETS}      # per market
+_providers: dict[str, MarketDataProvider] = {}                        # one instance per market, built lazily
+_state_lock = threading.Lock()
+
+
+# ------------------------------------------------------------------ helpers
+def _resolve_market(market: str | None) -> MarketSpec:
+    """Validate a market identifier. Unknown -> 400; omitted -> the default market."""
+    if market is None or not market.strip():
+        return settings.market_spec
+    try:
+        return get_market(market)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _provider_for(code: str) -> MarketDataProvider:
+    """The provider instance dedicated to `code` (never shared across markets)."""
+    with _state_lock:
+        provider = _providers.get(code)
+        if provider is None:
+            provider = _providers[code] = get_provider(code, get_store().symbols(code))
+        return provider
+
+
+def _market_info(code: str) -> dict:
+    """Everything the UI needs to label/format one market. Every response carries it so
+    the frontend never has to guess (or default to) a market/currency."""
+    spec = get_market(code)
+    exchange = settings.exchange_for(code)
+    return {
+        "market": spec.code,
+        "market_name": spec.name,
+        "exchange": exchange,
+        "label": spec.badge_label(exchange),
+        "option_label": spec.option_label(exchange),
+        "currency_code": spec.currency_code,
+        "currency_symbol": spec.currency_symbol,
+        "timezone": spec.timezone,
+        "locale": spec.locale,
+        "example_symbols": list(spec.example_symbols),
+        "session": session_status(spec, holidays=settings.holidays_for(code)),
+    }
+
+
+def _watchlist_response(code: str) -> dict:
+    return {**get_store().describe(code), "readonly": settings.watchlist_readonly, "market_info": _market_info(code)}
+
+
+def _require_writable() -> None:
+    if settings.watchlist_readonly:
+        raise HTTPException(status_code=403, detail="Watchlist editing is disabled on this deployment (WATCHLIST_READONLY)")
+
+
+def _http_from_store(exc: WatchlistError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+# ------------------------------------------------------------------ markets / health
+@app.get("/api/markets")
+def markets():
+    store = get_store()
+    out = []
+    for code in MARKETS:
+        supported = code in PROVIDER_MARKETS.get(settings.market_data_provider.strip().lower(), ())
+        out.append(
+            {
+                **_market_info(code),
+                "watchlist_size": len(store.symbols(code)),
+                "data_provider": settings.market_data_provider,
+                "provider_supports_market": supported,
+            }
+        )
+    return {"default_market": settings.market_spec.code, "markets": out}
 
 
 @app.get("/api/health")
-def health():
+def health(market: str | None = Query(None, description="IN | US; defaults to the default market")):
+    spec = _resolve_market(market)
+    code = spec.code
+    provider = _provider_for(code)
     model_status = "unavailable"
     try:
         load_model()
@@ -55,56 +151,190 @@ def health():
 
     return {
         "status": "ok",
+        "market": code,
         "server_time": datetime.now(timezone.utc).isoformat(),
         "uptime_seconds": (datetime.now(timezone.utc) - _start_time).total_seconds(),
-        "market_data_provider": _provider.name,
-        "is_live_data": _provider.is_live,
-        "data_status": _provider.data_status,
-        "data_feed": getattr(_provider, "feed", None),
+        "market_data_provider": provider.name,
+        "is_live_data": provider.is_live,
+        "data_status": provider.data_status,
+        "data_feed": getattr(provider, "feed", None),
         "model_status": model_status,
-        "update_count": _update_count,
-        "watchlist_size": len(settings.watchlist_symbols),
+        "update_count": _update_counts[code],
+        "watchlist_size": len(get_store().symbols(code)),
+        "currency_symbol": spec.currency_symbol,
+        "market_info": _market_info(code),
+        "config_warnings": settings.config_warnings,
     }
 
 
+# ------------------------------------------------------------------ watchlists
+class WatchlistAdd(BaseModel):
+    market: str
+    symbol: str
+
+
+class WatchlistReset(BaseModel):
+    market: str
+
+
+@app.get("/api/watchlist")
+def get_watchlist(market: str | None = Query(None, description="IN | US; defaults to the default market")):
+    return _watchlist_response(_resolve_market(market).code)
+
+
+@app.post("/api/watchlist")
+def add_to_watchlist(body: WatchlistAdd):
+    """Add a symbol to ONE market's watchlist after checking the data provider can serve it.
+
+    Failure modes are deliberately distinct: 422 = the symbol is invalid / unknown / has too
+    little history (the user should fix it); 409 = already listed; 503 = we could not reach
+    the provider to verify (try again - nothing was added and nothing is assumed valid)."""
+    _require_writable()
+    spec = _resolve_market(body.market)
+    code = spec.code
+    exchange = settings.exchange_for(code)
+    store = get_store()
+
+    try:
+        qualified = qualify_symbol(body.symbol, spec, exchange)
+    except InvalidSymbolError as exc:
+        raise HTTPException(status_code=422, detail=f"Not a valid {spec.name} symbol: {exc}") from exc
+
+    if qualified in store.symbols(code):                       # cheap checks before any network call
+        raise HTTPException(status_code=409, detail=f"{qualified} is already in the {spec.name} watchlist")
+    if len(store.symbols(code)) >= store.max_size:
+        raise HTTPException(status_code=422, detail=f"The {spec.name} watchlist is limited to {store.max_size} symbols")
+
+    provider = _provider_for(code)
+    try:
+        candles = provider.get_ohlcv(qualified, limit=settings.min_history_candles * 5)
+    except SymbolNotFoundError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No market data found for {qualified} on {spec.badge_label(exchange)}. Check the spelling; "
+                f"symbols are interpreted for the selected market, so switch markets to add a stock listed elsewhere. ({exc})"
+            ),
+        ) from exc
+    except ProviderUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not verify {qualified} right now because the data provider is unavailable or rate-limited. "
+                   f"Nothing was added - please try again shortly. ({exc})",
+        ) from exc
+    if len(candles) < settings.min_history_candles:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{qualified} returned only {len(candles)} candles; at least {settings.min_history_candles} "
+                   f"are needed to compute breakout indicators.",
+        )
+
+    try:
+        store.add(code, qualified)
+    except WatchlistError as exc:
+        raise _http_from_store(exc) from exc
+    provider.sync_symbols(store.symbols(code))
+    return {**_watchlist_response(code), "added": qualified, "company_name": provider.company_name(qualified)}
+
+
+@app.delete("/api/watchlist/{symbol}")
+def remove_from_watchlist(symbol: str, market: str = Query(..., description="IN | US")):
+    _require_writable()
+    spec = _resolve_market(market)
+    try:
+        qualified = qualify_symbol(symbol, spec, settings.exchange_for(spec.code))
+    except InvalidSymbolError as exc:
+        raise HTTPException(status_code=422, detail=f"Not a valid {spec.name} symbol: {exc}") from exc
+    try:
+        get_store().remove(spec.code, qualified)
+    except WatchlistError as exc:
+        raise _http_from_store(exc) from exc
+    _provider_for(spec.code).sync_symbols(get_store().symbols(spec.code))
+    return {**_watchlist_response(spec.code), "removed": qualified}
+
+
+@app.post("/api/watchlist/reset")
+def reset_watchlist(body: WatchlistReset):
+    """Restore ONE market's default watchlist. The other market is untouched."""
+    _require_writable()
+    spec = _resolve_market(body.market)
+    get_store().reset(spec.code)
+    _provider_for(spec.code).sync_symbols(get_store().symbols(spec.code))
+    return _watchlist_response(spec.code)
+
+
+# ------------------------------------------------------------------ analysis
 @app.get("/api/opportunities")
-def opportunities():
-    global _update_count
-    results, model_meta = run_inference_cycle(settings.watchlist_symbols, _provider)
+def opportunities(market: str | None = Query(None, description="IN | US; defaults to the default market")):
+    spec = _resolve_market(market)
+    code = spec.code
+    store = get_store()
+    desc = store.describe(code)
+    items = desc["symbols"]
+    symbols = [i["symbol"] for i in items]                       # the WHOLE active watchlist, never truncated
+    provider = _provider_for(code)
+    provider.sync_symbols(symbols)
+
+    results, model_meta = run_inference_cycle(symbols, provider)
     ranked = rank_opportunities(results)
-    status = data_status_summary(results, _provider)
-    _update_count += 1
+    is_default = {i["symbol"]: i["is_default"] for i in items}
+    for row in ranked:
+        row["is_default"] = is_default.get(row["symbol"], False)
+    status = data_status_summary(results, provider)
+    with _state_lock:
+        _update_counts[code] += 1
+        update_count = _update_counts[code]
 
     n_alerts = sum(1 for r in ranked if r["is_alert"])
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "is_live_data": _provider.is_live,
+        "market": code,
+        "is_live_data": provider.is_live,
         "data_status": status["data_status"],
-        "data_feed": getattr(_provider, "feed", None),
+        "data_feed": getattr(provider, "feed", None),
         "data_latency_ms": status["latency_ms"],
         "symbols_unavailable": status["symbols_unavailable"],
-        "provider": _provider.name,
+        "symbol_errors": status["symbol_errors"],
+        "provider": provider.name,
+        "market_info": _market_info(code),
         "model": model_meta,
+        "watchlist": {
+            "size": len(items),
+            "customized": desc["customized"],
+            "added_count": sum(1 for i in items if not i["is_default"]),
+            "removed_defaults": desc["removed_defaults"],
+            "max_size": store.max_size,
+            "readonly": settings.watchlist_readonly,
+        },
         "summary": {
             "stocks_monitored": len(ranked),
             "high_probability_opportunities": n_alerts,
-            "live_update_count": _update_count,
+            "live_update_count": update_count,
             "alert_threshold": settings.probability_alert_threshold,
+            "failed_symbols": len(status["symbol_errors"]),
         },
         "opportunities": ranked,
     }
 
 
 @app.get("/api/stock/{symbol}")
-def stock_detail(symbol: str, limit: int = Query(200, ge=30, le=1000)):
-    symbol = symbol.upper()
-    if symbol not in settings.watchlist_symbols:
-        raise HTTPException(status_code=404, detail=f"{symbol} is not in the configured watchlist")
-
-    from backend.data.providers import ProviderUnavailableError
-
+def stock_detail(
+    symbol: str,
+    limit: int = Query(200, ge=30, le=1000),
+    market: str | None = Query(None, description="IN | US; defaults to the default market"),
+):
+    spec = _resolve_market(market)
+    code = spec.code
     try:
-        raw = _provider.get_ohlcv(symbol, limit=limit)
+        symbol = qualify_symbol(symbol, spec, settings.exchange_for(code))
+    except InvalidSymbolError as exc:
+        raise HTTPException(status_code=404, detail=f"Invalid symbol for {spec.name}: {exc}") from exc
+    if symbol not in get_store().symbols(code):
+        raise HTTPException(status_code=404, detail=f"{symbol} is not in the {spec.name} watchlist")
+
+    provider = _provider_for(code)
+    try:
+        raw = provider.get_ohlcv(symbol, limit=limit)
     except ProviderUnavailableError as exc:
         raise HTTPException(status_code=503, detail=f"Data unavailable for {symbol}: {exc}") from exc
     feats = build_features(raw)
@@ -137,10 +367,12 @@ def stock_detail(symbol: str, limit: int = Query(200, ge=30, le=1000)):
 
     return {
         "symbol": symbol,
-        "is_live_data": _provider.is_live,
-        "data_status": _provider.data_status,
-        "data_feed": getattr(_provider, "feed", None),
-        "provider": _provider.name,
+        "market": code,
+        "is_live_data": provider.is_live,
+        "data_status": provider.data_status,
+        "data_feed": getattr(provider, "feed", None),
+        "provider": provider.name,
+        "market_info": _market_info(code),
         "candles": candles,
         "resistance": round(float(latest["resistance"]), 2) if latest["resistance"] == latest["resistance"] else None,
         "breakout_confirmation_price": (
@@ -211,7 +443,11 @@ def config():
         "confirmation_threshold_pct": settings.confirmation_threshold_pct,
         "volume_confirmation_multiple": settings.volume_confirmation_multiple,
         "probability_alert_threshold": settings.probability_alert_threshold,
-        "watchlist": settings.watchlist_symbols,
+        "watchlist": settings.watchlist_symbols,        # default market's DEFAULT list (training / backtest)
+        "watchlists": {code: get_store().symbols(code) for code in MARKETS},
         "market_data_provider": settings.market_data_provider,
+        "default_market": settings.market_spec.code,
+        "market_info": _market_info(settings.market_spec.code),
+        "config_warnings": settings.config_warnings,
         "refresh_interval_seconds": settings.refresh_interval_seconds,
     }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import CandlestickChart from "./CandlestickChart";
+import { formatPrice, resolveMarketInfo } from "../lib/format";
 
 function IndicatorRow({ label, value, suffix = "" }) {
   return (
@@ -11,31 +12,32 @@ function IndicatorRow({ label, value, suffix = "" }) {
   );
 }
 
-export default function StockDetail({ symbol }) {
+export default function StockDetail({ symbol, market }) {
   const [detail, setDetail] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  // Keyed on market AND symbol. The previous stock's details are dropped immediately, so
+  // nothing from the previous market/symbol can be shown while the new one loads.
   useEffect(() => {
-    if (!symbol) return;
-    let cancelled = false;
-    setLoading(true);
+    setDetail(null);
     setError(null);
+    if (!symbol || !market) return;
+    const ctrl = new AbortController();
+    setLoading(true);
     api
-      .stockDetail(symbol, 180)
+      .stockDetail(symbol, market, 180, ctrl.signal)
       .then((d) => {
-        if (!cancelled) setDetail(d);
+        if (!ctrl.signal.aborted) setDetail(d);
       })
       .catch((e) => {
-        if (!cancelled) setError(e.message);
+        if (!ctrl.signal.aborted && e?.name !== "AbortError") setError(e.message);
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!ctrl.signal.aborted) setLoading(false);
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [symbol]);
+    return () => ctrl.abort();
+  }, [symbol, market]);
 
   if (!symbol) {
     return (
@@ -45,7 +47,7 @@ export default function StockDetail({ symbol }) {
     );
   }
 
-  if (loading && !detail) {
+  if (loading && !detail && !error) {
     return (
       <div className="flex h-full items-center justify-center rounded border border-base-800 bg-base-900 p-8 text-sm text-ink-500">
         Loading {symbol}…
@@ -61,7 +63,8 @@ export default function StockDetail({ symbol }) {
     );
   }
 
-  if (!detail) return null;
+  if (!detail || detail.symbol !== symbol || detail.market !== market) return null;
+  const m = resolveMarketInfo(detail.market_info);     // currency/time zone come from the response itself
 
   const probPct = detail.breakout_probability !== null ? Math.round(detail.breakout_probability * 100) : null;
 
@@ -72,11 +75,12 @@ export default function StockDetail({ symbol }) {
           <div className="flex items-center gap-2">
             <h2 className="text-lg font-semibold text-ink-100">{detail.symbol}</h2>
             <span className="rounded bg-base-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-500">
-              {detail.is_live_data ? "LIVE" : "DEMO"}
+              {(detail.data_status || (detail.is_live_data ? "live" : "demo")).toUpperCase()}
             </span>
+            <span className="rounded bg-base-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-500">{m.exchange}</span>
           </div>
           <div className="mt-0.5 font-mono text-2xl tabular text-ink-100">
-            ${detail.candles[detail.candles.length - 1]?.close.toFixed(2)}
+            {formatPrice(detail.candles[detail.candles.length - 1]?.close, m)}
           </div>
         </div>
         {probPct !== null ? (
@@ -96,6 +100,7 @@ export default function StockDetail({ symbol }) {
       <div className="grid grid-cols-1 gap-4 p-4 lg:grid-cols-[1fr_220px]">
         <CandlestickChart
           candles={detail.candles}
+          marketInfo={m}
           resistance={detail.resistance}
           confirmationPrice={detail.breakout_confirmation_price}
         />
@@ -113,8 +118,8 @@ export default function StockDetail({ symbol }) {
 
           <div>
             <div className="mb-1.5 text-[11px] uppercase tracking-wide text-ink-500">Levels</div>
-            <IndicatorRow label="Resistance" value={detail.resistance} />
-            <IndicatorRow label="Confirmation Zone" value={detail.breakout_confirmation_price} />
+            <IndicatorRow label="Resistance" value={detail.resistance !== null ? formatPrice(detail.resistance, m) : null} />
+            <IndicatorRow label="Confirmation Zone" value={detail.breakout_confirmation_price !== null ? formatPrice(detail.breakout_confirmation_price, m) : null} />
           </div>
 
           {detail.model && (

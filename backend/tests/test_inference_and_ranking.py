@@ -31,21 +31,21 @@ class _FlakyProvider(MarketDataProvider):
 def test_provider_failure_does_not_crash_inference_cycle():
     """A single symbol's provider failure must degrade gracefully (marked
     unavailable) rather than raising and taking down the whole endpoint."""
-    provider = _FlakyProvider(fail_symbol="MSFT")
-    results, _ = run_inference_cycle(["AAPL", "MSFT", "NVDA"], provider)
+    provider = _FlakyProvider(fail_symbol="TCS.NS")
+    results, _ = run_inference_cycle(["RELIANCE.NS", "TCS.NS", "INFY.NS"], provider)
     assert len(results) == 3
-    failed = [r for r in results if r.symbol == "MSFT"]
+    failed = [r for r in results if r.symbol == "TCS.NS"]
     assert failed[0].error is not None and "provider_unavailable" in failed[0].error
     assert failed[0].breakout_probability is None
 
     status = data_status_summary(results, provider)
     assert status["data_status"] == "partial"
-    assert "MSFT" in status["symbols_unavailable"]
+    assert "TCS.NS" in status["symbols_unavailable"]
 
 
 def test_data_status_summary_all_unavailable():
-    provider = _FlakyProvider(fail_symbol="AAPL")
-    results, _ = run_inference_cycle(["AAPL"], provider)
+    provider = _FlakyProvider(fail_symbol="RELIANCE.NS")
+    results, _ = run_inference_cycle(["RELIANCE.NS"], provider)
     status = data_status_summary(results, provider)
     assert status["data_status"] == "unavailable"
 
@@ -66,7 +66,7 @@ def test_model_loads_without_retraining():
 
 def test_inference_cycle_runs_for_all_symbols():
     provider = DemoDataProvider()
-    symbols = ["AAPL", "MSFT", "NVDA"]
+    symbols = ["RELIANCE.NS", "TCS.NS", "INFY.NS"]
     results, _ = run_inference_cycle(symbols, provider)
     assert len(results) == len(symbols)
     for r in results:
@@ -76,7 +76,7 @@ def test_inference_cycle_runs_for_all_symbols():
 
 def test_ranking_sorts_by_probability_descending():
     provider = DemoDataProvider()
-    results, _ = run_inference_cycle(["AAPL", "MSFT", "NVDA", "TSLA"], provider)
+    results, _ = run_inference_cycle(["RELIANCE.NS", "TCS.NS", "INFY.NS", "SBIN.NS"], provider)
     ranked = rank_opportunities(results)
     scored = [r for r in ranked if r["breakout_probability"] is not None]
     probs = [r["breakout_probability"] for r in scored]

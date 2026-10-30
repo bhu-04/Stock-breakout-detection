@@ -12,7 +12,11 @@ export default function SummaryCards({ summary, modelStatus }) {
   if (!summary) return null;
   return (
     <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-      <Card label="Stocks Monitored" value={summary.stocks_monitored} />
+      <Card
+        label="Stocks Monitored"
+        value={summary.stocks_monitored}
+        sub={summary.failed_symbols ? `${summary.failed_symbols} failed to load` : undefined}
+      />
       <Card
         label="High-Probability Opportunities"
         value={summary.high_probability_opportunities}

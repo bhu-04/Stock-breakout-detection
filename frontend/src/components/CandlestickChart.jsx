@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { formatDateTime, formatTime, resolveMarketInfo } from "../lib/format";
 import {
   ComposedChart,
   Bar,
@@ -12,11 +13,6 @@ import {
 
 const UP = "#3fb37f";
 const DOWN = "#d1453d";
-
-function formatTime(ts) {
-  const d = new Date(ts);
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
 
 // Custom shape for a range-Bar whose dataKey is [low, high]. Recharts gives
 // us the pixel y/height for that [low, high] span; we derive the local
@@ -47,12 +43,12 @@ function CandleShape(props) {
   );
 }
 
-function ChartTooltip({ active, payload }) {
+function ChartTooltip({ active, payload, marketInfo }) {
   if (!active || !payload?.length) return null;
   const d = payload[0].payload;
   return (
     <div className="rounded border border-base-700 bg-base-900 px-3 py-2 text-xs shadow-lg">
-      <div className="mb-1 font-mono text-ink-500">{new Date(d.timestamp).toLocaleString()}</div>
+      <div className="mb-1 font-mono text-ink-500">{formatDateTime(d.timestamp, marketInfo)}</div>
       <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 tabular font-mono">
         <span className="text-ink-500">O</span><span>{d.open.toFixed(2)}</span>
         <span className="text-ink-500">H</span><span>{d.high.toFixed(2)}</span>
@@ -65,7 +61,8 @@ function ChartTooltip({ active, payload }) {
   );
 }
 
-export default function CandlestickChart({ candles, resistance, confirmationPrice }) {
+export default function CandlestickChart({ candles, resistance, confirmationPrice, marketInfo }) {
+  const m = resolveMarketInfo(marketInfo);
   const data = useMemo(
     () => candles.map((c) => ({ ...c, range: [c.low, c.high] })),
     [candles]
@@ -88,7 +85,7 @@ export default function CandlestickChart({ candles, resistance, confirmationPric
         <ComposedChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
           <XAxis
             dataKey="timestamp"
-            tickFormatter={formatTime}
+            tickFormatter={(ts) => formatTime(ts, m)}
             tick={{ fill: "#8b8a87", fontSize: 11 }}
             axisLine={{ stroke: "#26272c" }}
             tickLine={false}
@@ -102,7 +99,7 @@ export default function CandlestickChart({ candles, resistance, confirmationPric
             width={56}
             tickFormatter={(v) => v.toFixed(0)}
           />
-          <Tooltip content={<ChartTooltip />} cursor={{ stroke: "#35373d" }} />
+          <Tooltip content={<ChartTooltip marketInfo={m} />} cursor={{ stroke: "#35373d" }} />
           {resistance ? (
             <ReferenceLine
               y={resistance}

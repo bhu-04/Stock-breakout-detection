@@ -42,9 +42,13 @@ def _max_drawdown(equity_curve: np.ndarray) -> float:
     return float(drawdown.min()) if len(drawdown) else 0.0
 
 
-def _sharpe(returns: np.ndarray, periods_per_year: int = 252 * 78) -> float:
-    # 78 ~= number of 5-min candles in a US trading day; used only to
-    # annualize a demo-data Sharpe estimate, not a claim about real markets.
+def _sharpe(returns: np.ndarray, periods_per_year: int | None = None) -> float:
+    # Default annualisation follows the configured market's session (NSE:
+    # 375 min / 5 = 75 candles per day * ~248 days), not a hard-coded US
+    # session. Used only to annualize an estimate, not a claim about real markets.
+    if periods_per_year is None:
+        spec = settings.market_spec
+        periods_per_year = spec.trading_days_per_year * spec.candles_per_day(settings.demo_candle_interval_minutes)
     if returns.std(ddof=1) == 0 or len(returns) < 2:
         return 0.0
     return float(np.sqrt(periods_per_year) * returns.mean() / returns.std(ddof=1))

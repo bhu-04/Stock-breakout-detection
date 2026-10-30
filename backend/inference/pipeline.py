@@ -7,6 +7,7 @@ attach supporting signals for the dashboard.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -123,8 +124,40 @@ def run_inference_for_symbol(
     )
 
 
+def _failed(symbol: str, model: Optional[LoadedModel], error: str) -> SymbolInference:
+    nan = float("nan")
+    return SymbolInference(
+        symbol=symbol,
+        timestamp=datetime.now(timezone.utc),
+        breakout_probability=None,
+        current_price=nan,
+        rsi=nan,
+        relative_volume=nan,
+        trend_signal="Data Unavailable",
+        distance_from_resistance_pct=nan,
+        resistance=nan,
+        atr=nan,
+        macd_hist=nan,
+        model_available=model is not None,
+        error=error,
+    )
+
+
+def _safe_inference(symbol: str, provider: MarketDataProvider, model: Optional[LoadedModel]) -> SymbolInference:
+    """One bad symbol must never take down the whole refresh or borrow another's values."""
+    try:
+        return run_inference_for_symbol(symbol, provider, model)
+    except Exception as exc:  # unexpected data shape etc.; reported per symbol
+        logger.exception("Inference failed for %s", symbol)
+        return _failed(symbol, model, f"processing_error: {exc}")
+
+
 def run_inference_cycle(symbols: list[str], provider: MarketDataProvider) -> tuple[list[SymbolInference], Optional[dict]]:
-    """Run inference for every symbol. Returns (results, model_metadata_or_None)."""
+    """Run inference for EVERY symbol given (no truncation). Returns (results in the
+    same order as `symbols`, model_metadata_or_None).
+
+    Provider requests run on a small thread pool (settings.max_fetch_concurrency) so a
+    15-25 symbol watchlist refreshes in a few seconds without hammering the provider."""
     model: Optional[LoadedModel] = None
     model_meta = None
     try:
@@ -133,7 +166,12 @@ def run_inference_cycle(symbols: list[str], provider: MarketDataProvider) -> tup
     except ModelUnavailableError as exc:
         logger.warning("Inference running without a model: %s", exc)
 
-    results = [run_inference_for_symbol(sym, provider, model) for sym in symbols]
+    workers = max(1, min(settings.max_fetch_concurrency, len(symbols) or 1))
+    if workers == 1:
+        results = [_safe_inference(sym, provider, model) for sym in symbols]
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="inference") as pool:
+            results = list(pool.map(lambda sym: _safe_inference(sym, provider, model), symbols))
     return results, model_meta
 
 
@@ -141,7 +179,9 @@ def data_status_summary(results: list["SymbolInference"], provider: MarketDataPr
     """Aggregate per-symbol provider errors into an overall data-status summary."""
     unavailable = [r.symbol for r in results if r.error and r.error.startswith("provider_unavailable")]
     n = len(results)
-    if unavailable and len(unavailable) == n:
+    if not n:
+        status = provider.data_status
+    elif unavailable and len(unavailable) == n:
         status = "unavailable"
     elif unavailable:
         status = "partial"
@@ -151,5 +191,10 @@ def data_status_summary(results: list["SymbolInference"], provider: MarketDataPr
         "data_status": status,
         "provider": provider.name,
         "symbols_unavailable": unavailable,
+        "symbol_errors": {
+            r.symbol: r.error
+            for r in results
+            if r.error and (r.error.startswith("provider_unavailable") or r.error.startswith("processing_error"))
+        },
         "latency_ms": round(getattr(provider, "_last_latency_ms", None) or 0, 1) or None,
     }
